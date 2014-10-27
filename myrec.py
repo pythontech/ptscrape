@@ -19,8 +19,9 @@
 #   create query to fill grids
 #   post update to save as draft
 #=======================================================================
-from ptscrape import PageSource
+from ptscrape import PageSource, soup, bs_cdata
 from urlparse import urljoin
+import datetime
 import re
 import os
 import logging
@@ -40,6 +41,7 @@ class MyRec(object):
         :param replay: If True, read from cachedir instead of web site
         '''
         self.org = org
+        self.wbs_titles = {}
         self.baseurl = '%s/%s/' % (self.siteurl, org)
         with open(os.path.expanduser(authfile)) as f:
             self.user, self.password = f.readline().rstrip().split(':')
@@ -197,6 +199,55 @@ class MyRec(object):
         ts = self.timesheet(link)
         return link, ts
 
+    def timesheet_query(self, timesheet, hrows, arows):
+        '''Create a query for the submission of a timesheet.
+        timesheet contains hours and allowances.
+        hrows and arows contain mappings from WBS/allowance codes to row ids.
+        '''
+        query = []
+        wbss = timesheet.wbs_list()
+        print 'wbss',wbss
+        nwbs = len(wbss)
+        if len(wbss) > len(hrows):
+            raise ValueError('Need %d rows, only %d available' %
+                             (nwbs, len(hrows)))
+        for wbs, hrow in zip(wbss, hrows.values()[:nwbs]):
+            std, ovt = timesheet.jobs[wbs]
+            print 'std',std
+            print 'ovt',ovt
+            print 'hrow',hrow
+            # Standard
+            pfx = hrow[0] + '_'
+            query.append((pfx+'wbs_code', wbs))
+            query.append((pfx+'title', self.wbs_titles.get(wbs, wbs)))
+            for d in range(7):
+                query.append((pfx + 'd%d' % (1+d), '%.2f' % std[d]))
+            # Overtime
+            if any(ovt):
+                pfx = hrow[1] + '_'
+                query.append((pfx+'wbs_code', ''))
+                query.append((pfx+'title', ''))
+                for d in range(7):
+                    query.append((pfx + 'd%d' % (1+d), '%.2f' % ovt[d]))
+        # Allowances
+        aused = set()
+        for code, rowid in arows.items():
+            pfx = rowid+'_'
+            if code in timesheet.allowances:
+                days = timesheet.allowances[code]
+                aused.add(code)
+            else:
+                days = [0] * 7
+            for d in range(7):
+                query.append((pfx + 'd%d' % (1+d), '%.2f' % days[d]))
+        for code in timesheet.allowances:
+            if code not in aused:
+                raise ValueError('Allowance %s not found in form' % code)
+        # Delete any extra hours rows
+        for hrow in hrows.values()[nwbs:]:
+            query.append(('delete_grid_1', hrow[0]))
+        return query
+        
 class Timesheet:
     '''Model of a timesheet for a single week
       enddate     YYYY-MM-DD or None
@@ -204,6 +255,8 @@ class Timesheet:
       allowances  dict, key=code, value=7-element list of 1|0
     '''
     def __init__(self, enddate=None):
+        if isinstance(enddate, (str, unicode)):
+            enddate = date_from_iso(enddate)
         self.enddate = enddate
         self.name = None
         self.company = None
@@ -211,6 +264,8 @@ class Timesheet:
         self.allowances = {}    # code -> [days]
 
     def set_enddate(self, date):
+        if isinstance(date, (str, unicode)):
+            date = date_from_iso(date)
         if self.enddate is not None  and  date != self.enddate:
             raise ValueError('End date already set to %s' % self.enddate)
         self.enddate = date
@@ -218,12 +273,7 @@ class Timesheet:
     def add_hours(self, date, wbs, hours, type='STD'):
         '''Record hours against a given job code on one day.
         By default standard hours, unless type='OVT'.'''
-        if self.enddate is None:
-            raise ValueError('No enddate set')
-        day = date_sub(date, self.enddate) + 6
-        if day < 0 or day > 6:
-            raise ValueError('Date %s not in week ending %s' %
-                             (date, self.enddate))
+        day = self._day_number(date)
         if type not in ('STD,OVT'):
             raise ValueError('Invalid type "%s"; must be STD or OVT' % type)
         if wbs in self.jobs:
@@ -233,12 +283,7 @@ class Timesheet:
         job[1 if type=='OVT' else 0][day] += hours
 
     def add_allowance(self, date, code, quantity):
-        if self.enddate is None:
-            raise ValueError('No enddate set')
-        day = date_sub(date, self.enddate) + 6
-        if day < 0 or day > 6:
-            raise ValueError('Date %s not in week ending %s' %
-                             (date, self.enddate))
+        day = self._day_number(date)
         #if code not in allowance_desc:
         #    raise ValueError('Unknown allowance code "%s"' % code)
         if code in self.allowances:
@@ -246,6 +291,17 @@ class Timesheet:
         else:
             al = self.allowances[code] = [0]*7
         al[day] += quantity
+
+    def _day_number(self, date):
+        if isinstance(date, (str, unicode)):
+            date = date_from_iso(date)
+        if self.enddate is None:
+            raise ValueError('No enddate set')
+        day = (date - self.enddate).days + 6
+        if day < 0 or day > 6:
+            raise ValueError('Date %s not in week ending %s' %
+                             (date, self.enddate))
+        return day
 
     def show(self):
         print self.enddate
@@ -272,8 +328,11 @@ class Timesheet:
 
     @classmethod
     def from_tasklog_xml(cls, xml):
+        code_map = dict(ABP='SCM',
+                        ABR='SCW',
+                        ALH='MES')
         self = cls()
-        doc = BS.BeautifulStoneSoup(xml)
+        doc = soup.BeautifulSoup(xml, features='xml')
         self.name = bs_cdata(doc.find('name'))
         self.company = bs_cdata(doc.find('company'))
         week = doc.find('week')
@@ -294,7 +353,7 @@ class Timesheet:
                 # Old tasklog did not tag allowance with date
                 alday += 1
                 date = date_shift(self.enddate, -7 + alday)
-            self.add_allowance(date, code, float(quantity))
+            self.add_allowance(date, code_map[code], float(quantity))
         return self
 
     def write_tasklog_xml(self, filename):
@@ -370,9 +429,56 @@ class Timesheet:
             for d in range(7):
                 self.jobs[wbs][itype][d] = fix_day[d]
 
+def round_dict(d, quantum, target=None):
+    '''Round values in a dict to be multiples of a quantum.
+    Round the total up.
+    '''
+    units = {}
+    diff = {}
+    total = 0.0
+    utotal = 0
+    for k,v in d.items():
+        # print 'k,v',k,v
+        total += v
+        units[k] = quanta(v, quantum)
+        diff[k] = v - units[k] * quantum
+        utotal += units[k]
+    if target is None:
+        # Round up
+        import math
+        utarget = int(math.ceil(total / quantum))
+    else:
+        utarget = quanta(target, quantum)
+    # print 'utarget=%d utotal=%d' % (utarget,utotal)
+    if utotal < utarget:
+        # Initial adjusted values are too low.
+        # E.g. 2.3, 0.4, 0.9.  units=2,0,1  utotal=3
+        #      total=3.6, utarget=4
+        #      diff=0.3, 0.4, -0.1
+        # want to round up the largest
+        # so units[k] := 2,1,1
+        d2 = sorted(diff.keys(), key=lambda x:diff[x], reverse=True)
+        for k in d2[:utarget-utotal]:
+            units[k] += 1
+    elif utotal > utarget:
+        # Initial adjusted values are too high
+        d2 = sorted(diff.keys(), key=lambda x:diff[x])
+        for k in d2[:utotal-utarget]:
+            units[k] -= 1
+    adj = {}
+    for k,u in units.items():
+        adj[k] = u * quantum
+    return adj
+
+def quanta(value, quantum):
+    '''Integer for which value is the nearest multiple'''
+    return int(round(value / quantum))
+
+def date_from_iso(isodate):
+    return datetime.date(*[int(d) for d in isodate.split('-')])
+
 if __name__=='__main__':
     def last_saturday():
-        import datetime
         today = datetime.date.today()
         lastsat = today - datetime.timedelta(days=today.isoweekday() % 7 + 1)
         date = lastsat.strftime('%Y-%m-%d')
@@ -384,6 +490,7 @@ if __name__=='__main__':
     ap.add_argument('--replay', action='store_true')
     ap.add_argument('--date', default=last_saturday())
     ap.add_argument('--rows', type=int, default=1)
+    ap.add_argument('--timesheet', type=str)
     ap.add_argument('action')
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO)
@@ -407,5 +514,19 @@ if __name__=='__main__':
         hrows, arows = rec.parse_timesheet(ts)
         if len(hrows) < args.rows:
             tsr = rec.add_timesheet_rows(href, args.rows - len(hrows))
+    elif args.action == 'query':
+        ts = Timesheet.from_tasklog_xml_file(args.timesheet)
+        #print 'ts',ts
+        #print 'allow',ts.allowances
+        href, tspage = rec.get_timesheet(args.date)
+        hrows, arows = rec.parse_timesheet(tspage)
+        if len(hrows) < args.rows:
+            tspage = rec.add_timesheet_rows(href, args.rows - len(hrows))
+        hrows, arows = rec.parse_timesheet(tspage)
+        #print 'hrows',hrows
+        #print 'arows',arows
+        query = rec.timesheet_query(ts, hrows, arows)
+        for n,v in sorted(query):
+            print n,v
     else:
         raise ValueError('Unknown action %r' % args.action)
