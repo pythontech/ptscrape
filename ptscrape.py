@@ -2,7 +2,10 @@
 #       Screen-scraping framework
 #=======================================================================
 import logging
-import bs4 as soup
+try:
+    import bs4 as soup
+except ImportError:
+    import BeautifulSoup as soup
 import urllib2
 from urllib import urlencode
 from urlparse import urljoin
