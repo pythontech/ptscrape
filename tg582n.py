@@ -119,14 +119,23 @@ def txrx_gb(label,values):
     if not m:
         raise ValueError('Data Transferred mismatch')
     txunit, rxunit = m.groups()
-    if not all([unit in ('MB','GB') for unit in (txunit,rxunit)]):
-        raise ValueError('Unexpected units')
+    if not all([unit in ('B','kB','MB','GB') for unit in (txunit,rxunit)]):
+        raise ValueError('Unexpected units %r' % ((txunit,rxunit),))
     tx, rx = [float(v.strip().replace(',','.')) for v in values.split('/')]
-    if txunit=='MB':
-        tx /= 1e3
-    if rxunit=='MB':
-        rx /= 1e3
-    return tx, rx
+    txGB = scale_GB(tx, txunit)
+    rxGB = scale_GB(rx, rxunit)
+    return txGB, rxGB
+
+def scale_GB(num, unit):
+    if unit == 'GB':
+        return num / 1
+    if unit == 'MB':
+        return num / 1e3
+    if unit == 'kB':
+        return num / 1e6
+    if unit == 'B':
+        return num / 1e9
+    raise ValueError('Unknown scale %s' % unit)
 
 def md5hex(string):
     return md5(string).hexdigest()
