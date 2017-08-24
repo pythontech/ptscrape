@@ -26,7 +26,7 @@ class PageSource(object):
     def get(self, url, query=None, tag=None):
         '''HTTP GET request on a URL with optional query'''
         if query:
-            url += '?' + query.urlencode()
+            url += '?' + urlencode(query)
         _log.info('GET %s', url)
         return self._transact(url, tag=tag)
 
